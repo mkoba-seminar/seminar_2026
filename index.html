@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>レシート仕訳アシスタント</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 16px; line-height: 1.6; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.5rem; }
+  button { font-size: 1rem; padding: 10px 16px; margin: 6px 0; }
+  img#preview { max-width: 100%; max-height: 300px; display: none; margin: 8px 0; }
+  label { display: block; margin: 6px 0; }
+  input[type=text], input[type=number] { width: 100%; padding: 6px; box-sizing: border-box; font-size: 1rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; }
+  .warn { color: #b00020; font-weight: bold; }
+  .note { color: #555; font-size: .9rem; }
+  #status { color: #064; }
+</style>
+</head>
+<body>
+<h1>レシート仕訳アシスタント</h1>
+<p class="note">AIの結果は下書きです。必ず自分で確認・修正してください。選んだ写真は Google のサーバーに送信されます。個人情報の入ったレシートは使わないでください。</p>
+
+<h2>1. レシートの写真を選ぶ</h2>
+<input type="file" id="file" accept="image/*">
+<img id="preview" alt="選んだレシート">
+<div><button id="btnExtract" disabled>2. 読み取る</button></div>
+<p id="status"></p>
+
+<h2>読み取り結果(修正できます)</h2>
+<label>日付 <input type="text" id="date" placeholder="2026-10-28"></label>
+<label>店名 <input type="text" id="store"></label>
+<label>合計(税込・円) <input type="number" id="total"></label>
+<label>支払方法 <input type="text" id="payment"></label>
+<table>
+  <thead><tr><th>品名</th><th>金額(税込)</th></tr></thead>
+  <tbody id="items"></tbody>
+</table>
+<p id="receiptWarn" class="warn"></p>
+
+<div><button id="btnJournal" disabled>3. 仕訳を提案してもらう</button></div>
+
+<h2>仕訳の提案</h2>
+<table>
+  <thead><tr><th>借方/貸方</th><th>勘定科目</th><th>金額</th></tr></thead>
+  <tbody id="journal"></tbody>
+</table>
+<p id="journalReason"></p>
+<p id="journalWarn" class="warn"></p>
+
+<script type="module">
+// ===== 設定(ここを自分の値に書き換える) =====
+// Firebase コンソール → プロジェクトの設定 → 「マイアプリ」(Web) に表示される値
+const firebaseConfig = {
+  apiKey: "AIzaSyBK7n1KOPiqZcy3IDVrYNwMO4TSYWAtgM0",
+  authDomain: "seminar-5438d.firebaseapp.com",
+  projectId: "seminar-5438d",
+  storageBucket: "seminar-5438d.firebasestorage.app",
+  messagingSenderId: "213258311675",
+  appId: "1:213258311675:web:4f26752d8fa11c01011d5e"
+};
+// Firebase JS SDK のバージョン(公式ドキュメントで最新を確認して書き換えてよい)
+const FIREBASE_VERSION = "12.5.0";
+// 使うモデル。無料枠で使えるか・廃止されていないかは公式で確認する。
+const MODEL_NAMES = ["gemini-3.5-flash-lite"]; // 先頭から順に試す
+// 自分が使う勘定科目に書き換える
+const ACCOUNTS = ["消耗品費", "事務用品費", "会議費", "交際費", "旅費交通費",
+                  "通信費", "水道光熱費", "新聞図書費", "雑費", "仮払消費税"];
+// ==========================================
+
+const $ = (id) => document.getElementById(id);
+const base = `https://www.gstatic.com/firebasejs/${FIREBASE_VERSION}`;
+const { initializeApp } = await import(`${base}/firebase-app.js`);
+const { getAI, getGenerativeModel, GoogleAIBackend, Schema } = await import(`${base}/firebase-ai.js`);
+
+const app = initializeApp(firebaseConfig);
+
+// ===== App Check(練習用のデバッグ設定) =====
+// AI Logic は App Check が強制されていることがあり、トークンがないと 401 エラーになる。
+// 練習(localhost)では、下の true にしておくと、ブラウザの Console にデバッグトークンが表示される。
+// そのトークンを Firebase コンソールの App Check に登録すると動く。
+// App Check の強制を解除した場合(方法A)は false にしてよい。
+const USE_APPCHECK_DEBUG = true;
+if (USE_APPCHECK_DEBUG) {
+  self.FIREBASE_APPCHECK_DEBUG_TOKEN = true; // initializeAppCheck より前に書くこと
+  const { initializeAppCheck, ReCaptchaEnterpriseProvider } =
+    await import(`${base}/firebase-app-check.js`);
+  initializeAppCheck(app, {
+    provider: new ReCaptchaEnterpriseProvider("debug-placeholder"), // デバッグ中は使われない仮の値
+    isTokenAutoRefreshEnabled: true
+  });
+}
+// ==========================================
+
+const ai = getAI(app, { backend: new GoogleAIBackend() });
+
+/* ---------- スキーマ(AIの出力形式を固定する) ---------- */
+const receiptSchema = Schema.object({
+  properties: {
+    date: Schema.string({ description: "購入日。yyyy-MM-dd形式" }),
+    store: Schema.string({ description: "店名" }),
+    total: Schema.integer({ description: "税込合計金額(円)" }),
+    paymentMethod: Schema.string({ description: "支払方法" }),
+    items: Schema.array({
+      items: Schema.object({
+        properties: {
+          name: Schema.string(),
+          amount: Schema.integer({ description: "税込金額(円)" })
+        }
+      })
+    })
+  },
+  optionalProperties: ["date", "store", "paymentMethod"]
+});
+
+const journalSchema = Schema.object({
+  properties: {
+    lines: Schema.array({
+      items: Schema.object({
+        properties: {
+          side: Schema.enumString({ enum: ["借方", "貸方"] }),
+          account: Schema.string(),
+          amount: Schema.integer()
+        }
+      })
+    }),
+    reason: Schema.string({ description: "その科目を選んだ理由を1〜2文で" })
+  }
+});
+
+const makeModels = (schema) => MODEL_NAMES.map((name) =>
+  getGenerativeModel(ai, {
+    model: name,
+    generationConfig: { responseMimeType: "application/json", responseSchema: schema }
+  })
+);
+const receiptModels = makeModels(receiptSchema);
+const journalModels = makeModels(journalSchema);
+
+// 失敗したら自動で再試行し、だめなら次のモデルに切り替える
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function generateWithRetry(models, input, onStatus) {
+  let lastErr;
+  for (let m = 0; m < models.length; m++) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await models[m].generateContent(input);
+      } catch (err) {
+        lastErr = err;
+        const msg = String(err.message || err);
+        const retryable = /503|429|500|404|Deadline/.test(msg);
+        if (!retryable) throw err; // 設定の間違いなどは、すぐに表示する
+        onStatus?.(`混み合っています。再試行中...(${MODEL_NAMES[m]}、${attempt}回目)`);
+        await sleep(2000 * attempt);
+        if (/404/.test(msg)) break; // そのモデルは使えないので、次のモデルへ
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/* ---------- 画像の準備(大きい写真を縮小して送る) ---------- */
+async function fileToPart(file, maxSide = 1600) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+  return { inlineData: { data: dataUrl.split(",")[1], mimeType: "image/jpeg" } };
+}
+
+/* ---------- 画面の操作 ---------- */
+let currentFile = null;
+
+$("file").addEventListener("change", (e) => {
+  currentFile = e.target.files[0] || null;
+  if (currentFile) {
+    $("preview").src = URL.createObjectURL(currentFile);
+    $("preview").style.display = "block";
+  }
+  $("btnExtract").disabled = !currentFile;
+});
+
+function addItemRow(name = "", amount = "") {
+  const tr = document.createElement("tr");
+  for (const [value, type] of [[name, "text"], [amount, "number"]]) {
+    const td = document.createElement("td");
+    const input = document.createElement("input");
+    input.type = type;
+    input.value = value;
+    input.addEventListener("input", checkReceipt);
+    td.appendChild(input);
+    tr.appendChild(td);
+  }
+  $("items").appendChild(tr);
+}
+
+function readReceiptFromForm() {
+  const items = [...$("items").querySelectorAll("tr")].map((tr) => {
+    const [n, a] = tr.querySelectorAll("input");
+    return { name: n.value, amount: Number(a.value) || 0 };
+  });
+  return {
+    date: $("date").value,
+    store: $("store").value,
+    total: Number($("total").value) || 0,
+    paymentMethod: $("payment").value,
+    items
+  };
+}
+
+// 検算:明細の合計と合計金額が一致するか
+function checkReceipt() {
+  const r = readReceiptFromForm();
+  if (r.items.length === 0) { $("receiptWarn").textContent = ""; return; }
+  const sum = r.items.reduce((s, i) => s + i.amount, 0);
+  $("receiptWarn").textContent = sum !== r.total
+    ? `明細の合計(${sum}円)と合計金額(${r.total}円)が一致しません。読み取りを確認してください。`
+    : "";
+}
+$("total").addEventListener("input", checkReceipt);
+
+$("btnExtract").addEventListener("click", async () => {
+  $("status").textContent = "読み取り中...";
+  $("btnExtract").disabled = true;
+  try {
+    const prompt = `これは日本のレシートの画像です。内容を読み取ってJSONで返してください。
+- 金額はすべて円の整数(カンマや円記号は付けない)。
+- 明細の金額は税込で。税抜表記の場合は税込に直してください。
+- 読み取れない項目は推測せず、省略してください。
+- 合計は「合計」「お買上計」など、最終的な支払金額を使ってください。`;
+    const part = await fileToPart(currentFile);
+    const result = await generateWithRetry(receiptModels, [prompt, part], (t) => { $("status").textContent = t; });
+    const data = JSON.parse(result.response.text());
+
+    $("date").value = data.date ?? "";
+    $("store").value = data.store ?? "";
+    $("total").value = data.total ?? "";
+    $("payment").value = data.paymentMethod ?? "";
+    $("items").replaceChildren();
+    (data.items ?? []).forEach((i) => addItemRow(i.name, i.amount));
+    checkReceipt();
+    $("btnJournal").disabled = false;
+    $("status").textContent = "読み取り完了。内容を確認・修正してください。";
+  } catch (err) {
+    console.error(err);
+    $("status").textContent = "エラー: " + err.message;
+  } finally {
+    $("btnExtract").disabled = false;
+  }
+});
+
+$("btnJournal").addEventListener("click", async () => {
+  $("status").textContent = "仕訳を考え中...";
+  $("btnJournal").disabled = true;
+  try {
+    const r = readReceiptFromForm(); // 人が修正した内容を使う
+    const prompt = `次のレシート情報から、日本の個人事業主向けの仕訳を1件提案してください。
+- 借方の科目は次のリストから選ぶ: ${ACCOUNTS.join("、")}
+- 貸方は支払方法から判断(現金なら「現金」、カードなら「未払金」など)。
+- 消費税は税込経理とし、借方と貸方の合計金額を必ず一致させる。
+- 用途が不明で判断に迷う場合は、理由に迷った点を書く。
+
+レシート情報:
+${JSON.stringify(r)}`;
+    const result = await generateWithRetry(journalModels, prompt, (t) => { $("status").textContent = t; });
+    const data = JSON.parse(result.response.text());
+
+    $("journal").replaceChildren();
+    for (const line of data.lines ?? []) {
+      const tr = document.createElement("tr");
+      for (const text of [line.side, line.account, String(line.amount)]) {
+        const td = document.createElement("td");
+        td.textContent = text; // AIの出力は textContent で安全に表示
+        tr.appendChild(td);
+      }
+      $("journal").appendChild(tr);
+    }
+    $("journalReason").textContent = "理由: " + (data.reason ?? "");
+
+    // 検算:借方合計と貸方合計が一致するか
+    const debit = (data.lines ?? []).filter((l) => l.side === "借方").reduce((s, l) => s + l.amount, 0);
+    const credit = (data.lines ?? []).filter((l) => l.side === "貸方").reduce((s, l) => s + l.amount, 0);
+    $("journalWarn").textContent = debit !== credit
+      ? `借方(${debit}円)と貸方(${credit}円)が一致しません。` : "";
+    $("status").textContent = "完了。AIの提案は下書きです。自分で確認してください。";
+  } catch (err) {
+    console.error(err);
+    $("status").textContent = "エラー: " + err.message;
+  } finally {
+    $("btnJournal").disabled = false;
+  }
+});
+</script>
+</body>
+</html>
