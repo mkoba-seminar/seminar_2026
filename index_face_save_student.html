@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>顔照合アシスタント（初回登録→本人確認）</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 16px; line-height: 1.6; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.5rem; }
+  button { font-size: 1rem; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+  button:disabled { cursor: not-allowed; }
+  video { width: 100%; max-width: 480px; background: #000; border-radius: 8px; transform: scaleX(-1); }
+  input[type=number] { width: 90px; padding: 6px; font-size: 1rem; }
+  #result { font-size: 1.8rem; font-weight: bold; margin: 8px 0; }
+  .ok { color: #0a7d2c; }
+  .ng { color: #b00020; }
+  .note { color: #555; font-size: .9rem; }
+  #status { color: #064; }
+  #log { font-size: .9rem; padding-left: 20px; }
+</style>
+</head>
+<body>
+<h1>顔照合アシスタント</h1>
+<p class="note">1回目の撮影で顔の特徴ベクトルを保存し、2回目以降は1回目と同一人物かを判定します。顔画像は保存・送信しません（処理はこのブラウザ内）。保存するのは128個の数値と判定ログだけです。自分の顔だけで試してください。</p>
+
+<video id="video" autoplay muted playsinline></video>
+<p id="status">準備中...</p>
+
+<div>
+  <button id="btnShoot" disabled>撮影</button>
+  <label>しきい値 <input type="number" id="threshold" step="0.01" min="0.2" max="0.9" value="0.5"></label>
+</div>
+<div id="result">-</div>
+<p id="distance" class="note">距離: -（小さいほど似ている。目安: 同一人物は0.4前後以下）</p>
+
+<h2>判定ログ（直近5件）</h2>
+<ul id="log"><li>（なし）</li></ul>
+
+<h2>データ管理</h2>
+<button id="btnReset" disabled>登録データとログを削除（最初からやり直す）</button>
+<p class="note">匿名認証のため、このブラウザのサイトデータを消すと、保存済みの登録データに結び付かなくなります。データを消したいときは、必ず上のボタンから削除してください。</p>
+
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+<script type="module">
+// ===== 設定(ここを自分のFirebaseプロジェクトの値に書き換える) =====
+// Firebase コンソール → プロジェクトの設定 → 「マイアプリ」(Web) に表示される値を、
+// "YOUR_..." の部分にそれぞれコピーする。自分のプロジェクトの値だけを使うこと。
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_PROJECT_ID.firebasestorage.app",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId: "YOUR_APP_ID"
+};
+const FIREBASE_VERSION = "12.5.0";
+// App Check: 練習(localhost)では true にする。ブラウザのConsoleに出る
+// 「App Check debug token」を、自分のFirebaseコンソールの App Check に登録すると動く。
+// 本番サイトキーを使う場合は false にして、下の RECAPTCHA_ENTERPRISE_SITE_KEY を書き換える。
+const USE_APPCHECK_DEBUG = true;
+const RECAPTCHA_ENTERPRISE_SITE_KEY = "debug-placeholder"; // デバッグ中は使われない仮の値
+const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
+const SAMPLES_PER_SHOT = 3; // 1回の撮影で連続取得して平均するフレーム数
+// ================
+
+const $ = (id) => document.getElementById(id);
+const base = `https://www.gstatic.com/firebasejs/${FIREBASE_VERSION}`;
+const { initializeApp } = await import(`${base}/firebase-app.js`);
+const { getFirestore, doc, getDoc, setDoc, addDoc, getDocs, deleteDoc, collection, query, orderBy, limit, serverTimestamp } =
+  await import(`${base}/firebase-firestore.js`);
+const { getAuth, signInAnonymously } = await import(`${base}/firebase-auth.js`);
+
+if (USE_APPCHECK_DEBUG) {
+  self.FIREBASE_APPCHECK_DEBUG_TOKEN = true; // initializeAppCheck より前に書くこと
+}
+const app = initializeApp(firebaseConfig);
+{
+  const { initializeAppCheck, ReCaptchaEnterpriseProvider } = await import(`${base}/firebase-app-check.js`);
+  initializeAppCheck(app, {
+    provider: new ReCaptchaEnterpriseProvider(RECAPTCHA_ENTERPRISE_SITE_KEY),
+    isTokenAutoRefreshEnabled: true
+  });
+}
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+const video = $("video"), statusEl = $("status"), resultEl = $("result"), distEl = $("distance");
+const detectorOptions = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+
+let uid = null;
+let template = null; // Float32Array(128) または null
+let busy = false;
+
+const userDoc = () => doc(db, "faceUsers", uid);
+const checksCol = () => collection(db, "faceUsers", uid, "checks");
+
+function updateShootButton() {
+  $("btnShoot").textContent = template ? "撮影して本人確認" : "撮影して登録（1回目）";
+}
+
+async function loadLog() {
+  try {
+    const snap = await getDocs(query(checksCol(), orderBy("at", "desc"), limit(5)));
+    const ul = $("log");
+    ul.innerHTML = "";
+    if (snap.empty) { ul.innerHTML = "<li>（なし）</li>"; return; }
+    snap.forEach((d) => {
+      const v = d.data();
+      const t = v.at?.toDate ? v.at.toDate().toLocaleString("ja-JP") : "-";
+      const li = document.createElement("li");
+      li.textContent = `${t}　${v.match ? "一致" : "不一致"}　距離 ${Number(v.distance).toFixed(3)}`;
+      ul.appendChild(li);
+    });
+  } catch (e) { console.error(e); }
+}
+
+async function detect() {
+  return faceapi.detectSingleFace(video, detectorOptions).withFaceLandmarks().withFaceDescriptor();
+}
+
+// 1回の撮影＝短い間に数フレーム取り、平均して1つのベクトルにする
+async function captureDescriptor() {
+  const samples = [];
+  let tries = 0;
+  while (samples.length < SAMPLES_PER_SHOT && tries < 30) {
+    tries++;
+    const r = await detect();
+    if (r) samples.push(r.descriptor);
+    await new Promise((res) => setTimeout(res, 300));
+  }
+  if (samples.length < SAMPLES_PER_SHOT) return null;
+  const avg = new Float32Array(128);
+  samples.forEach((d) => d.forEach((v, i) => (avg[i] += v / samples.length)));
+  return avg;
+}
+
+async function init() {
+  try {
+    statusEl.textContent = "モデルを読み込み中...";
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+      faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+      faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+    ]);
+    statusEl.textContent = "カメラを起動中...";
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+    await video.play();
+
+    statusEl.textContent = "匿名認証を確認中...";
+    await auth.authStateReady();
+    uid = (auth.currentUser || (await signInAnonymously(auth)).user).uid;
+
+    statusEl.textContent = "登録データを確認中...";
+    const snap = await getDoc(userDoc());
+    template = snap.exists() ? new Float32Array(snap.data().descriptor) : null;
+    updateShootButton();
+    await loadLog();
+
+    $("btnShoot").disabled = false;
+    $("btnReset").disabled = false;
+    statusEl.textContent = template
+      ? "登録済みです。顔を映して「撮影して本人確認」を押してください。"
+      : "未登録です。正面を向いて「撮影して登録」を押してください。";
+  } catch (e) {
+    console.error(e);
+    const extra = e.code === "auth/operation-not-allowed"
+      ? " Firebaseコンソールの Authentication で『匿名』を有効にしてください。"
+      : e.code === "permission-denied"
+      ? " Firestoreのルールに faceUsers の許可を追加してください。"
+      : e.code === "auth/api-key-not-valid.-please-pass-a-valid-api-key." || /api-key/i.test(String(e.message))
+      ? " firebaseConfig の値を、自分のプロジェクトの値に書き換えましたか？"
+      : "";
+    statusEl.textContent = "エラー [" + (e.code || "unknown") + "]: " + (e.message || e) + extra;
+  }
+}
+
+$("btnShoot").addEventListener("click", async () => {
+  if (busy) return;
+  busy = true;
+  $("btnShoot").disabled = true;
+  resultEl.textContent = "-"; resultEl.className = "";
+  statusEl.textContent = "撮影中...正面を向いて動かないでください。";
+  try {
+    const desc = await captureDescriptor();
+    if (!desc) {
+      statusEl.textContent = "顔を十分に検出できませんでした。明るい場所でもう一度試してください。";
+      return;
+    }
+
+    if (!template) {
+      // 1回目: 保存
+      await setDoc(userDoc(), { descriptor: Array.from(desc), createdAt: serverTimestamp() });
+      template = desc;
+      updateShootButton();
+      resultEl.textContent = "登録しました";
+      resultEl.className = "ok";
+      distEl.textContent = "距離: -";
+      statusEl.textContent = "次回からは、同じボタンで本人確認ができます。";
+    } else {
+      // 2回目以降: 1回目と比較
+      const d = faceapi.euclideanDistance(desc, template);
+      const th = parseFloat($("threshold").value);
+      const match = d < th;
+      resultEl.textContent = match ? "同一人物です" : "別人の可能性があります";
+      resultEl.className = match ? "ok" : "ng";
+      distEl.textContent = `距離: ${d.toFixed(3)}（しきい値 ${th}）`;
+      await addDoc(checksCol(), { match, distance: d, threshold: th, at: serverTimestamp() });
+      statusEl.textContent = "判定結果をログに保存しました。";
+      await loadLog();
+    }
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = "エラー [" + (e.code || "unknown") + "]: " + (e.message || e);
+  } finally {
+    busy = false;
+    $("btnShoot").disabled = false;
+  }
+});
+
+$("btnReset").addEventListener("click", async () => {
+  if (!confirm("登録データと判定ログをすべて削除します。よろしいですか？")) return;
+  try {
+    const snap = await getDocs(checksCol());
+    await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
+    await deleteDoc(userDoc());
+    template = null;
+    updateShootButton();
+    resultEl.textContent = "-"; resultEl.className = "";
+    distEl.textContent = "距離: -";
+    await loadLog();
+    statusEl.textContent = "削除しました。もう一度「撮影して登録」から始められます。";
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = "削除エラー: " + (e.message || e);
+  }
+});
+
+init();
+</script>
+</body>
+</html>
