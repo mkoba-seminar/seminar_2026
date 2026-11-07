@@ -39,6 +39,58 @@
    - 例：`https://ユーザー名.github.io/リポジトリ名/index_face_save_student.html`
 4. 保存版は、`ユーザー名.github.io` を Firebase の「承認済みドメイン」に追加しておく（下の準備の手順4）
 
+### C. Firebase Hosting で公開して開く（保存版はこちらが簡単）
+
+保存版を、自分の Firebase プロジェクトの上で動かす方法です。Firebase の Hosting は、無料の Spark プランで使えます。承認済みドメインの追加も、通常は不要です。
+
+事前に、下の「Firebase 保存版」の「準備」の手順1〜5（プロジェクト作成、設定値の書き換え、匿名ログイン、Firestore のルールなど）を済ませておいてください。
+
+1. [Node.js](https://nodejs.org/) を入れたうえで、Firebase CLI を入れる
+
+   ```bash
+   npm install -g firebase-tools
+   ```
+
+2. Firebase にログインする（ブラウザが開くので、Firebase を使う Google アカウントを選ぶ）
+
+   ```bash
+   firebase login
+   ```
+
+3. このフォルダで、Hosting の設定を作る
+
+   ```bash
+   firebase init hosting
+   ```
+
+   聞かれる内容は、次のように答えます。
+
+   | 質問 | 答え |
+   |---|---|
+   | プロジェクトをどうするか | 「Use an existing project」を選び、自分のプロジェクトを選ぶ |
+   | public directory（公開するフォルダ） | `public` |
+   | single-page app にするか | `N` |
+   | GitHub での自動ビルド・デプロイを設定するか | `N` |
+
+4. 保存版のファイルを、公開フォルダに `index.html` という名前でコピーする（`firebaseConfig` を書き換えたあとのファイルを使う）
+
+   ```bash
+   cp index_face_save_student.html public/index.html
+   ```
+
+   Windows のコマンドプロンプトでは、`copy index_face_save_student.html public\index.html` です。`public/index.html` はすでにあるので、上書きしてかまいません。
+5. 公開する
+
+   ```bash
+   firebase deploy --only hosting
+   ```
+
+6. 最後に表示される **Hosting URL**（`https://プロジェクトID.web.app`）を開く
+
+HTMLファイルを直したら、もう一度手順4と5を行うと、公開したページが更新されます。
+
+`public` フォルダには、公開してよいファイルだけを入れてください。`README.md` などは入れません。
+
 ## 使い方（共通の操作）
 
 1. ページを開き、カメラの使用を **許可** する
@@ -118,7 +170,9 @@
 
 ### 動かす
 
-1. 上の「動かし方」の A で、`http://localhost:3000/index_face_save_student.html` を開く
+1. 次のどちらかで開く
+   - **練習**：上の「動かし方」の A で、`http://localhost:3000/index_face_save_student.html` を開く
+   - **Firebase 上で動かす**：上の「動かし方」の C で公開し、`https://プロジェクトID.web.app` を開く
 2. カメラを許可し、「撮影して登録（1回目）」を押す
 3. 2回目以降は「撮影して本人確認」を押す。判定ログが画面に出る
 
@@ -131,6 +185,8 @@
 | `permission-denied` | Firestore のルールに `faceUsers` の許可を追加する（上の例） |
 | 401 エラー（App Check） | 準備の6のとおり、コンソールのデバッグトークンを Firebase コンソールに登録する |
 | `auth/unauthorized-domain` | 承認済みドメインに、いま開いているドメインを追加する |
+| `firebase: command not found` | Firebase CLI が入っていません。`npm install -g firebase-tools` を実行する |
+| Hosting のURLに、Firebase の初期ページが出る | `public/index.html` を、`firebaseConfig` を書き換えた保存版のファイルで上書きし、もう一度 `firebase deploy --only hosting` を実行する |
 | 登録が消えた・見つからない | 下の「注意」を参照 |
 
 ### 注意（保存版）
